@@ -434,6 +434,135 @@ The remaining code-level opportunities are therefore low-level backend work:
 
 There were no obvious application-level or server-level optimizations left after the runtime sweeps.
 
+
+## Assembly experiment follow-up
+
+After the initial profiling above, the remaining work moved from C++ and server settings into the SpaceMIT/RVV assembly paths. The useful findings are mostly negative, but they narrow the real optimization surface considerably.
+
+### Guarded backend profiling
+
+An experimental branch adds env-gated counters for SpaceMIT backend staging:
+
+```text
+branch: exp/backend-profile
+commit: 07bb371 spacemit: add experimental backend profile counters
+flag:   SPACEMIT_PROFILE=1
+```
+
+Short `llama-bench` runs showed just how copy-heavy the current TCM path is:
+
+| Model | TCM-A calls | TCM-B calls | TCM-A bytes | TCM-B bytes |
+|---|---:|---:|---:|---:|
+| Gemma 4 E4B QAT (`pp128/tg64`) | 510 | 22,538 | 251 MB | 173 GB |
+| Qwen REAP (`pp128/tg64`) | 4,514 | 16,323 | 207 MB | 98 GB |
+
+Hot `llama-server` profiles, with models already loaded, confirmed the same thing:
+
+| Model | Main hot spots |
+|---|---|
+| Gemma 4 E4B QAT | `memcpy_main_loop34` ~38%, `INNER_BLK_LOOP756` ~20%, libgomp sync ~20% combined |
+| Qwen REAP | `memcpy_main_loop34` ~25%, `_K_LPST652` ~19%, `gemm_kernel_i8i8_m1` ~11%, plus gated-delta/SSM/f32 dot work |
+
+### Q4_K 32×256 / zero-point path
+
+The source has a fast 32×256 IME2 path for `Q4_0`:
+
+```cpp
+static const tensor_traits<block_q4_0, 256, 32> q4_0_32x256_q8_0;
+```
+
+but `Q4_K` currently uses only 32×32:
+
+```cpp
+static const tensor_traits<block_q4_K, 32, 32> q4_k_32x32_q8_0;
+```
+
+I prototyped a `block_q4_K,256,32` trait/repack path. The first version had to fall back to the C++ reference HP zero-point path and was unusably slow:
+
+```text
+Gemma 4 E4B Q4_K_M tiny test: pp16 0.65 t/s, tg4 0.34 t/s
+```
+
+A second version used the existing `m4` zero-point assembly plus a hybrid `m1_zp` path. The `m1_zp` hybrid was correct against the new self-test harness, but the model path still did not win:
+
+| Model | Result with Q4_K 32×256 prototype |
+|---|---:|
+| Gemma 4 E4B Q4_K_M | `pp512 29.77 t/s`, `tg128 6.13 t/s` |
+| Qwen REAP Q4_K_M | `pp512 28.37 t/s`, `tg128 7.52 t/s` |
+| Gemma 4 E4B QAT Q4_0 regression | `pp512 67.68 t/s`, `tg128 7.71 t/s` |
+
+Conclusion: simply forcing Q4_K through the 32×256 HP layout is not enough. The existing 32×32 Q4_K path is already competitive, and improving Q4_K now requires optimizing the existing zero-point HP assembly itself, not just adding a trait.
+
+### IME2 HP kernel self-test harness
+
+A guarded self-test target was added on a separate branch:
+
+```text
+branch: exp/ime2-hp-zp-harness
+commit: 8ff8877 spacemit: add IME2 HP kernel self-test harness
+target: spacemit-ime2-kernel-selftest
+```
+
+The harness registers an A100 thread, pins to core 8, and compares the hand-written HP kernels against the local reference implementation:
+
+```text
+m1:    max_abs=0 max_rel=0 bad=0/32
+m4:    max_abs=0 max_rel=0 bad=0/128
+m1_zp: max_abs=0 max_rel=0 bad=0/32   # hybrid prototype only
+```
+
+This is the required safety net for future inline-assembly edits to `gemm_kernel_i8i4_hp_m1` and `gemm_kernel_i8i4_hp_m4`.
+
+### TCM copy/staging experiments
+
+The largest hot symbol is a custom RVV copy loop, not libc `memcpy`:
+
+```asm
+vle8.v  v0,(a1)
+vle8.v  v8,(t2)
+vse8.v  v0,(a0)
+vse8.v  v8,(t3)
+```
+
+Simple changes did not help:
+
+| Experiment | Result |
+|---|---|
+| Disable B-panel TCM staging (`SPACEMIT_DISABLE_TCM_B=1`) | worse: E4B QAT `7.72→6.77 t/s`, Qwen `7.75→7.27 t/s` |
+| Keep quantized A outside TCM, still stage B | worse: E4B QAT `7.74→7.41 t/s`, Qwen `7.78→7.60 t/s` |
+| A100/VLEN=1024 copy loop 4096B unroll | worse/flat: E4B QAT dropped to `7.60 t/s`, Qwen flat |
+| `prefetch.r` in the current 2048B A100 copy loop | flat in repeated runs: E4B QAT `7.77 t/s`, Qwen `7.78 t/s` |
+
+Conclusion: the copy is expensive, but it is buying enough TCM locality to be worth it. The next useful version would need to fuse or pipeline copy+kernel feed; standalone copy-loop tweaks are exhausted.
+
+### OpenMP and activation experiments
+
+A no-OpenMP build slightly improved `llama-bench` but regressed the real server path:
+
+| Model | OpenMP server | no-OpenMP server |
+|---|---:|---:|
+| Gemma 4 E4B QAT | `7.53 t/s` | `7.16 t/s` |
+| Qwen REAP | `6.99 t/s` | `6.74 t/s` |
+
+So removing OpenMP is not a production win. A persistent worker/barrier design may still be interesting, but it is an architectural rewrite rather than a CMake option.
+
+The F32 SiLU/SwiGLU path already has RVV intrinsics. A prototype F16 RVV SwiGLU widening/narrowing path compiled but did not move model benchmarks:
+
+```text
+Gemma 4 E4B QAT tg256: 7.72 t/s
+Qwen REAP tg256:       7.81 t/s
+```
+
+### Current backend conclusion
+
+The remaining plausible wins are very narrow and assembly-heavy:
+
+1. optimize the existing Q4_K/ZP HP assembly, especially the `m4` path;
+2. build a fused/double-buffered TCM copy+kernel-feed path instead of a better standalone copy;
+3. design persistent A100 workers/barriers if OpenMP synchronization becomes the main target.
+
+All simple C++/configuration/RVV-intrinsic changes tested so far were neutral or slower, and none were merged into production.
+
 ## What kind of AI workload fits the K3?
 
 The K3 is not a “run a big chatbot fast” board. It is a quantized edge-inference board with a surprisingly capable CPU-side matrix engine.
