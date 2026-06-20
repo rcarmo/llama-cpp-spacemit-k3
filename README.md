@@ -1,34 +1,43 @@
 # llama.cpp SpaceMIT/TurboQuant K3 fork
 
-## Gemma 4 E2B QAT — 128K Cached Server Profile
+## Gemma 4 E2B QAT — Sane High-Performance Interactive Profile
 
-For long-context coding sessions where context capacity matters more than maximum model quality, use the E2B QAT + MTP profile:
+Fast, low-RAM interactive/coding server. Use when context capacity matters less
+than latency and throughput:
 
 ```sh
-scripts/run-gemma-e2b-qat-128k-server.sh
+scripts/run-gemma-e2b-qat-server.sh
 ```
 
-Live configuration validated on Milk-V SpaceMIT K3:
+Validated live on Milk-V SpaceMIT K3:
 
 | Setting | Value |
 |---|---|
 | Model | `gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` |
 | Draft model | `mtp-gemma-4-E2B-it-qat-Q4_0.gguf` |
-| Context | `131072` tokens |
+| Context | `32768` |
 | Threads | `8` / `threads-batch=8` |
-| uBatch | `1024` |
+| Batch / uBatch | `2048` / `1024` |
 | KV cache | `f16` K/V |
-| Prompt cache | enabled, 8 GiB budget |
-| Slot save path | `/home/me/gemma-e2b-128k-slot-cache` |
 | MTP | enabled, `draft-mtp`, `n_max=4` |
+| Prompt cache | enabled, 8 GiB budget |
 
-Notes:
+Measured smoke (cold): **~82 tok/s prefill, ~27.5 tok/s generation, MTP acceptance 0.80**.
+Warm request with shared prefix: prompt-cache hit, ~1 s round trip.
 
-- The server reports `default_generation_settings.n_ctx = 131072` via `/props`.
-- `--cache-prompt` is active. This is the useful prefix cache for repeated code-context requests.
-- `--cache-reuse` is currently disabled by llama-server when `draft-mtp` is active (`cache_reuse is not supported by this context`).
-- Smoke test on a short prompt showed MTP acceptance at 14/24 draft tokens (0.58) and ~20.9 tok/s generation.
+Sizing rationale:
 
+- **32K context, not 128K.** Prompt-processing (prefill) cost on this RISC-V board
+  degrades with prompt length, and the server runs a single slot. A 90K+ token
+  prompt takes many minutes to prefill and blocks every other request until it
+  finishes. 32K is the practical interactive ceiling.
+- **threads 8** matches the 8 performance cores and the 8-block TCM pool (t<8
+  segfaults; t>8 contends with efficiency cores / TCM blocks).
+- **f16 KV** is ~8.4 tok/s vs ~6.7 tok/s for q8_0 on this board; KV is small for E2B.
+- **Prompt cache** makes a repeated system-prompt + file prefix free after the
+  first request.
+- `--cache-reuse` (KV shifting) is auto-disabled by llama-server under `draft-mtp`,
+  so it is omitted.
 
 ## Gemma 4 26B A4B QAT — Optimal Server Configuration
 
