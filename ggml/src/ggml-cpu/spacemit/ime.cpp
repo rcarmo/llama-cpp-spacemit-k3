@@ -11,6 +11,7 @@
 #include "ime_env.h"
 #include "ime_kernels.h"
 #include "ops.h"
+#include "quants.h"
 #include "repack.h"
 #include "rvv_kernels.h"
 #include "spine_mem_pool.h"
@@ -986,7 +987,10 @@ class tensor_traits_iq_compact : public tensor_traits_base {
         const ggml_tensor * src1 = op->src[1];
         const ggml_tensor * ids  = op->src[2];
         size = 0;
-        // One dequantized src0 row per compute thread for the native compact-IQ dot path.
+        // Quantized src1 rows for direct compact-IQ x Q8_K dots, plus one
+        // fallback dequantized src0 row per compute thread.
+        size += ggml_row_size(GGML_TYPE_Q8_K, src0->ne[0]) * (size_t) ggml_nelements(src1) / (size_t) src0->ne[0];
+        size = GGML_PAD(size, sizeof(int64_t));
         size += (size_t) n_threads * (size_t) src0->ne[0] * sizeof(float);
         size = GGML_PAD(size, sizeof(int64_t));
         const int64_t n_as     = src0->ne[2];
@@ -1061,6 +1065,121 @@ class tensor_traits_iq_compact : public tensor_traits_base {
         }
         return sum;
 #endif
+    }
+
+    static int32_t dot_i8_i8(const int8_t * a, const int8_t * b, int n) {
+#if defined(__riscv_v_intrinsic)
+        int32_t sum = 0;
+        for (int i = 0; i < n;) {
+            const size_t vl = __riscv_vsetvl_e8m1((size_t) (n - i));
+            vint8m1_t va = __riscv_vle8_v_i8m1(a + i, vl);
+            vint8m1_t vb = __riscv_vle8_v_i8m1(b + i, vl);
+            vint16m2_t prod = __riscv_vwmul_vv_i16m2(va, vb, vl);
+            vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, vl);
+            vint32m1_t red  = __riscv_vwredsum_vs_i16m2_i32m1(prod, zero, vl);
+            sum += __riscv_vmv_x_s_i32m1_i32(red);
+            i += (int) vl;
+        }
+        return sum;
+#else
+        int32_t sum = 0;
+        for (int i = 0; i < n; ++i) {
+            sum += (int32_t) a[i] * (int32_t) b[i];
+        }
+        return sum;
+#endif
+    }
+
+    static float dot_iq2_xs_q8k(const block_iq2_xs * x, const block_q8_K * y, int64_t k) {
+        GGML_ASSERT(k % QK_K == 0);
+        const int64_t nb = k / QK_K;
+        float sum = 0.0f;
+        for (int64_t i = 0; i < nb; ++i) {
+            const float d = GGML_FP16_TO_FP32(x[i].d) * y[i].d;
+            for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+                const float db0 = d * (0.5f + (x[i].scales[ib32] & 0x0f)) * 0.25f;
+                const float db1 = d * (0.5f + (x[i].scales[ib32] >>  4)) * 0.25f;
+                int8_t qv[32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint16_t q = x[i].qs[4*ib32 + l];
+                    const uint8_t * grid = (const uint8_t *) (iq2xs_grid + (q & 511));
+                    const uint8_t signs = ksigns_iq2xs[q >> 9];
+                    for (int j = 0; j < 8; ++j) {
+                        qv[l*8 + j] = (int8_t) ((signs & kmask_iq2xs[j]) ? -(int) grid[j] : (int) grid[j]);
+                    }
+                }
+                sum += db0 * (float) dot_i8_i8(qv +  0, y[i].qs + ib32*32 +  0, 16);
+                sum += db1 * (float) dot_i8_i8(qv + 16, y[i].qs + ib32*32 + 16, 16);
+            }
+        }
+        return sum;
+    }
+
+    static float dot_iq3_xxs_q8k(const block_iq3_xxs * x, const block_q8_K * y, int64_t k) {
+        GGML_ASSERT(k % QK_K == 0);
+        const int64_t nb = k / QK_K;
+        float sum = 0.0f;
+        for (int64_t i = 0; i < nb; ++i) {
+            const float d = GGML_FP16_TO_FP32(x[i].d) * y[i].d;
+            const uint8_t * qs = x[i].qs;
+            const uint8_t * scales_and_signs = qs + QK_K/4;
+            for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+                uint32_t aux32;
+                memcpy(&aux32, scales_and_signs + 4*ib32, sizeof(uint32_t));
+                const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+                int8_t qv[32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t signs = ksigns_iq2xs[(aux32 >> (7*l)) & 127];
+                    const uint8_t * grid1 = (const uint8_t *) (iq3xxs_grid + qs[2*l+0]);
+                    const uint8_t * grid2 = (const uint8_t *) (iq3xxs_grid + qs[2*l+1]);
+                    for (int j = 0; j < 4; ++j) {
+                        qv[l*8 + j + 0] = (int8_t) ((signs & kmask_iq2xs[j+0]) ? -(int) grid1[j] : (int) grid1[j]);
+                        qv[l*8 + j + 4] = (int8_t) ((signs & kmask_iq2xs[j+4]) ? -(int) grid2[j] : (int) grid2[j]);
+                    }
+                }
+                sum += db * (float) dot_i8_i8(qv, y[i].qs + ib32*32, 32);
+                qs += 8;
+            }
+        }
+        return sum;
+    }
+
+    static float dot_iq4_xs_q8k(const block_iq4_xs * x, const block_q8_K * y, int64_t k) {
+        GGML_ASSERT(k % QK_K == 0);
+        const int64_t nb = k / QK_K;
+        float sum = 0.0f;
+        for (int64_t i = 0; i < nb; ++i) {
+            const float d = GGML_FP16_TO_FP32(x[i].d) * y[i].d;
+            const uint8_t * qs = x[i].qs;
+            for (int ib = 0; ib < QK_K/32; ++ib) {
+                const int ls = ((x[i].scales_l[ib/2] >> (4*(ib%2))) & 0x0f) | (((x[i].scales_h >> (2*ib)) & 3) << 4);
+                const float dl = d * (ls - 32);
+                int8_t qv[32];
+                for (int j = 0; j < 16; ++j) {
+                    qv[j + 0]  = kvalues_iq4nl[qs[j] & 0x0f];
+                    qv[j + 16] = kvalues_iq4nl[qs[j] >> 4];
+                }
+                sum += dl * (float) dot_i8_i8(qv, y[i].qs + ib*32, 32);
+                qs += 16;
+            }
+        }
+        return sum;
+    }
+
+    static bool dot_iq_direct_q8k(ggml_type type, const void * x, const block_q8_K * y, int64_t k, float * out) {
+        switch (type) {
+            case GGML_TYPE_IQ2_XS:
+                *out = dot_iq2_xs_q8k((const block_iq2_xs *) x, y, k);
+                return true;
+            case GGML_TYPE_IQ3_XXS:
+                *out = dot_iq3_xxs_q8k((const block_iq3_xxs *) x, y, k);
+                return true;
+            case GGML_TYPE_IQ4_XS:
+                *out = dot_iq4_xs_q8k((const block_iq4_xs *) x, y, k);
+                return true;
+            default:
+                return false;
+        }
     }
 
     static float dot_iq2_xs_f32(const block_iq2_xs * x, const float * y, int64_t k) {
@@ -1180,6 +1299,8 @@ class tensor_traits_iq_compact : public tensor_traits_base {
         GGML_ASSERT(to_float != nullptr);
 
         void * wdata_cur = params->wdata;
+        const size_t q8_row_size = ggml_row_size(GGML_TYPE_Q8_K, ne10);
+        char * qsrc1 = (char *) incr_ptr_aligned(&wdata_cur, q8_row_size * (size_t) ggml_nelements(src1) / (size_t) ne10, sizeof(int64_t));
         float * deq_rows = (float *) incr_ptr_aligned(&wdata_cur, (size_t) nth * (size_t) ne00 * sizeof(float), sizeof(int64_t));
         float * deq_row  = deq_rows + (size_t) ith * (size_t) ne00;
 
@@ -1189,6 +1310,16 @@ class tensor_traits_iq_compact : public tensor_traits_base {
         int64_t * matrix_row_counts = (int64_t *) incr_ptr_aligned(&wdata_cur, n_as * sizeof(int64_t), sizeof(int64_t));
         mmid_row_mapping * matrix_rows = (mmid_row_mapping *) incr_ptr_aligned(&wdata_cur, n_as * max_rows * sizeof(mmid_row_mapping), sizeof(int64_t));
         GGML_ASSERT(params->wsize >= (size_t) ((char *) wdata_cur - (char *) params->wdata));
+
+        const int64_t src1_rows = ne11 * ne12 * ne13;
+        for (int64_t row = ith; row < src1_rows; row += nth) {
+            const int64_t i11q = row % ne11;
+            const int64_t i12q = (row / ne11) % ne12;
+            const int64_t i13q = row / (ne11 * ne12);
+            const float * src1_row = (const float *) ((const char *) src1->data + i13q * nb13 + i12q * nb12 + i11q * nb11);
+            quantize_row_q8_K_generic(src1_row, qsrc1 + (size_t) row * q8_row_size, ne10);
+        }
+        ggml_barrier(params->threadpool);
 
         if (ith == 0) {
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
@@ -1224,10 +1355,14 @@ class tensor_traits_iq_compact : public tensor_traits_base {
                 const float * src1_col = (const float *) src1_col_bytes;
                 const char * src0_row = src0_cur + ir0 * nb01;
 
+                const int64_t src1_row_idx = i11 + i12 * ne11;
+                const block_q8_K * src1_col_q8 = (const block_q8_K *) (qsrc1 + (size_t) src1_row_idx * q8_row_size);
                 float v;
-                if (!dot_iq_direct_f32(src0->type, src0_row, src1_col, ne00, &v)) {
-                    to_float(src0_row, deq_row, ne00);
-                    v = dot_f32(deq_row, src1_col, ne00);
+                if (!dot_iq_direct_q8k(src0->type, src0_row, src1_col_q8, ne00, &v)) {
+                    if (!dot_iq_direct_f32(src0->type, src0_row, src1_col, ne00, &v)) {
+                        to_float(src0_row, deq_row, ne00);
+                        v = dot_f32(deq_row, src1_col, ne00);
+                    }
                 }
                 float * dst_col = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2);
                 dst_col[ir0] = v;
