@@ -133,7 +133,7 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public tensor_traits_base {
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -973,7 +973,7 @@ class tensor_traits_iq_compact : public tensor_traits_base {
   public:
     explicit constexpr tensor_traits_iq_compact(ggml_type type) : type_(type) {}
 
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
         if (op->op != GGML_OP_MUL_MAT_ID || op->src[0]->type != type_) {
             return false;
         }
@@ -985,12 +985,10 @@ class tensor_traits_iq_compact : public tensor_traits_base {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
         const ggml_tensor * ids  = op->src[2];
-        const ggml_type vec_dot_type = ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         size = 0;
-        if (src1->type != vec_dot_type) {
-            size += ggml_row_size(vec_dot_type, ggml_nelements(src1));
-            size = GGML_PAD(size, sizeof(int64_t));
-        }
+        // One dequantized src0 row per compute thread for the native compact-IQ dot path.
+        size += (size_t) n_threads * (size_t) src0->ne[0] * sizeof(float);
+        size = GGML_PAD(size, sizeof(int64_t));
         const int64_t n_as     = src0->ne[2];
         const int64_t max_rows = ids->ne[0] * ids->ne[1];
         size += n_as * sizeof(int64_t);
@@ -1016,68 +1014,58 @@ class tensor_traits_iq_compact : public tensor_traits_base {
         return true;
     }
 
+    static float dot_f32(const float * a, const float * b, int64_t n) {
+        float sum = 0.0f;
+        for (int64_t i = 0; i < n; ++i) {
+            sum += a[i] * b[i];
+        }
+        return sum;
+    }
+
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) const {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
         const ggml_tensor * ids  = op->src[2];
         ggml_tensor *       dst  = op;
         GGML_TENSOR_BINARY_OP_LOCALS
+
         const int ith = params->ith;
         const int nth = params->nth;
-        const ggml_type_traits_cpu * src0_traits  = ggml_get_type_traits_cpu(src0->type);
-        const ggml_type              vec_dot_type = src0_traits->vec_dot_type;
-        const ggml_vec_dot_t         vec_dot      = src0_traits->vec_dot;
-        const ggml_from_float_t      from_float   = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == vec_dot_type);
+
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
         GGML_ASSERT(nb00 == ggml_type_size(src0->type));
         GGML_ASSERT(nb10 == ggml_type_size(src1->type));
         GGML_ASSERT(nb0 == sizeof(float));
+
+        const ggml_type_traits * type_traits = ggml_get_type_traits(src0->type);
+        const ggml_to_float_t to_float = type_traits->to_float;
+        GGML_ASSERT(to_float != nullptr);
+
         void * wdata_cur = params->wdata;
-        char * qsrc1     = nullptr;
-        if (src1->type != vec_dot_type) {
-            qsrc1 = (char *) incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
-        }
+        float * deq_rows = (float *) incr_ptr_aligned(&wdata_cur, (size_t) nth * (size_t) ne00 * sizeof(float), sizeof(int64_t));
+        float * deq_row  = deq_rows + (size_t) ith * (size_t) ne00;
+
         const int64_t n_ids    = ids->ne[0];
         const int64_t n_as     = ne02;
         const int64_t max_rows = ids->ne[0] * ids->ne[1];
         int64_t * matrix_row_counts = (int64_t *) incr_ptr_aligned(&wdata_cur, n_as * sizeof(int64_t), sizeof(int64_t));
         mmid_row_mapping * matrix_rows = (mmid_row_mapping *) incr_ptr_aligned(&wdata_cur, n_as * max_rows * sizeof(mmid_row_mapping), sizeof(int64_t));
         GGML_ASSERT(params->wsize >= (size_t) ((char *) wdata_cur - (char *) params->wdata));
-        if (src1->type != vec_dot_type) {
-            const size_t nbw0 = ggml_type_size(vec_dot_type);
-            const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-            const size_t nbw2 = nbw1 * ne11;
-            const size_t nbw3 = nbw2 * ne12;
-            const size_t bs   = ggml_blck_size(vec_dot_type);
-            for (int64_t i13 = 0; i13 < ne13; ++i13) {
-                for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                        const int64_t block_start = (ith * (ne10 / bs)) / nth;
-                        const int64_t block_end   = ((ith + 1) * (ne10 / bs)) / nth;
-                        from_float((const float *) ((const char *) src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11 + block_start * bs * nb10),
-                                   (void *) (qsrc1 + i13 * nbw3 + i12 * nbw2 + i11 * nbw1 + block_start * nbw0),
-                                   (block_end - block_start) * bs);
-                    }
-                }
-            }
-        }
-        ggml_barrier(params->threadpool);
+
         if (ith == 0) {
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
-            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-                for (int64_t id = 0; id < n_ids; ++id) {
+            for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int32_t id = 0; id < n_ids; ++id) {
                     const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
-                    const int64_t row = matrix_row_counts[i02]++;
-                    GGML_ASSERT(row < max_rows);
-                    matrix_rows[i02 * max_rows + row] = { (int32_t) id, (int32_t) iid1 };
+                    matrix_rows[i02 * max_rows + matrix_row_counts[i02]] = { id, iid1 };
+                    matrix_row_counts[i02] += 1;
                 }
             }
         }
         ggml_barrier(params->threadpool);
-        const char * src1_base = src1->type == vec_dot_type ? (const char *) src1->data : qsrc1;
-        const size_t row_size  = ggml_row_size(vec_dot_type, ne10);
-        const bool src1_cont   = ggml_is_contiguous(src1);
+
+        const bool src1_cont = ggml_is_contiguous(src1);
         for (int64_t cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
             if (cne1 == 0) {
@@ -1093,11 +1081,14 @@ class tensor_traits_iq_compact : public tensor_traits_base {
                 const int64_t i12 = row_mapping.i2;
                 const int64_t i1  = row_mapping.i1;
                 const int64_t i2  = i12;
-                const char * src1_col = src1_base + ((src1_cont || src1->type != vec_dot_type) ? (i11 + i12 * ne11) * row_size : (i11 * nb11 + i12 * nb12));
+
+                const char * src1_col_bytes = (const char *) src1->data + (src1_cont ? (i11 + i12 * ne11) * ne10 * nb10 : (i11 * nb11 + i12 * nb12));
+                const float * src1_col = (const float *) src1_col_bytes;
+                const char * src0_row = src0_cur + ir0 * nb01;
+
+                to_float(src0_row, deq_row, ne00);
                 float * dst_col = (float *) ((char *) dst->data + i1 * nb1 + i2 * nb2);
-                float v;
-                vec_dot(ne00, &v, 0, src0_cur + ir0 * nb01, 0, src1_col, 0, 1);
-                dst_col[ir0] = v;
+                dst_col[ir0] = dot_f32(deq_row, src1_col, ne00);
             }
         }
     }
